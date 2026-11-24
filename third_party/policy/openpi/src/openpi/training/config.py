@@ -94,6 +94,11 @@ class DataConfig:
     # LeRobot dataset is using different keys to represent the action.
     action_sequence_keys: Sequence[str] = ("actions",)
 
+    # Rows before the current frame that the data loader puts in front of each action sequence. With 1, the
+    # sequence of a key has action_horizon + 1 rows and row 0 is the action of the frame before. LeRobot then
+    # also returns `<key>_is_pad`, which is true for a row outside the episode.
+    action_history: int = 0
+
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
 
@@ -385,6 +390,9 @@ class LeRobotYamDataConfig(DataConfigFactory):
     # Forwarded to LeRobot's video timestamp matching. Some long concatenated
     # videos require a slightly larger value because LeRobot compares float32 times.
     lerobot_tolerance_s: float = 1e-4
+    # The model state. With the last command in it, the actions are taken relative to the last command
+    # (yam_policy.StateInput), and the norm stats of the asset must have state_input.dim state dims.
+    state_input: yam_policy.StateInput = yam_policy.StateInput.MEASURED
     assets: AssetsConfig = dataclasses.field(default_factory=lambda: AssetsConfig(asset_id="yam"))
 
     @override
@@ -402,12 +410,17 @@ class LeRobotYamDataConfig(DataConfigFactory):
                         # Carry the prompt through (PromptFromLeRobotTask sets it from
                         # the task); RepackTransform drops any key not listed here.
                         "prompt": "prompt",
+                        **({"actions_is_pad": "action_is_pad"} if self.state_input.uses_last_command else {}),
                     }
-                )
+                ),
+                *([yam_policy.LastCommandFromActionHistory()] if self.state_input.uses_last_command else []),
             ]
         )
         data_transforms = _transforms.Group(
-            inputs=[yam_policy.YamInputs(model_type=model_config.model_type)],
+            inputs=[
+                yam_policy.YamStateInput(self.state_input),
+                yam_policy.YamInputs(model_type=model_config.model_type),
+            ],
             outputs=[yam_policy.YamOutputs(action_dim=7 * self.num_arms)],
         )
         if self.use_delta_joint_actions:
@@ -419,8 +432,17 @@ class LeRobotYamDataConfig(DataConfigFactory):
                 outputs=[_transforms.AbsoluteActions(mask)],
             )
         model_transforms = ModelTransformFactory()(model_config)
+        base = self.create_base_config(assets_dirs, model_config)
+        if self.state_input.uses_last_command and self.num_arms != 2:
+            raise ValueError(f"state_input {self.state_input.value} needs num_arms=2, got {self.num_arms}")
+        if base.norm_stats is not None and (dim := base.norm_stats["state"].mean.shape[-1]) != self.state_input.dim:
+            raise ValueError(
+                f"norm stats of asset {base.asset_id} have {dim} state dims; state_input {self.state_input.value} "
+                f"needs {self.state_input.dim} (scripts/stack_last_command_norm_stats.py writes them)"
+            )
         return dataclasses.replace(
-            self.create_base_config(assets_dirs, model_config),
+            base,
+            action_history=1 if self.state_input.uses_last_command else 0,
             lerobot_root=self.lerobot_root,
             lerobot_tolerance_s=self.lerobot_tolerance_s,
             repack_transforms=repack_transform,
@@ -1128,6 +1150,20 @@ _CONFIGS = [
     # RoboArena & PolaRiS configs.
     *roboarena_config.get_roboarena_configs(),
     *polaris_config.get_polaris_configs(),
+]
+
+
+def _abc130k_with_state_input(name: str, state_input: yam_policy.StateInput) -> TrainConfig:
+    base = next(config for config in _CONFIGS if config.name == "pi05_abc130k")
+    return dataclasses.replace(base, name=name, data=dataclasses.replace(base.data, state_input=state_input))
+
+
+# pi05_abc130k with the last command in the model state. The data field state_input selects the state.
+_CONFIGS += [
+    _abc130k_with_state_input("pi05_abc130k_last_command", yam_policy.StateInput.LAST_COMMAND),
+    _abc130k_with_state_input(
+        "pi05_abc130k_last_command_and_measured", yam_policy.StateInput.LAST_COMMAND_AND_MEASURED
+    ),
 ]
 
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):

@@ -229,7 +229,8 @@ def create_torch_dataset(
         root=data_config.lerobot_root,
         tolerance_s=data_config.lerobot_tolerance_s,
         delta_timestamps={
-            key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
+            key: [t / dataset_meta.fps for t in range(-data_config.action_history, action_horizon)]
+            for key in data_config.action_sequence_keys
         },
     )
     if data_config.prompt_from_task:
