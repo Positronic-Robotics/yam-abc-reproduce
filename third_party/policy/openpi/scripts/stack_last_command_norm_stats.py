@@ -7,10 +7,9 @@ Usage:
   e.g. assets/yam assets/yam_last_command_and_measured
 """
 
+import argparse
 import logging
 import pathlib
-
-import tyro
 
 import openpi.policies.yam_policy as yam_policy
 import openpi.shared.normalize as normalize
@@ -26,4 +25,8 @@ def main(src: pathlib.Path, out: pathlib.Path) -> None:
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    tyro.cli(main)
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("src", type=pathlib.Path, help="asset dir with the 14-D norm stats")
+    parser.add_argument("out", type=pathlib.Path, help="asset dir for the 28-D norm stats")
+    args = parser.parse_args()
+    main(args.src, args.out)
