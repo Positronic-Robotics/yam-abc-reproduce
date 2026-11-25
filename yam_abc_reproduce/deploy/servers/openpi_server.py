@@ -9,6 +9,9 @@ The only glue is a key remap: the client sends
 
     {"images": {<role>: HWC uint8}, "state": (S,), "prompt": str}
 
+and, for a config whose state input is the last command, "last_command": (S,), the last
+command sent to the arms.
+
 while your trained config's Input transform expects the feature keys your LeRobot
 dataset used (see data/formats/lerobot_format.py and your openpi TrainConfig). Bridge
 the two with --image-key-map; a config already reading `images`/`state`/`prompt`
@@ -41,6 +44,9 @@ os.environ.setdefault("FSSPEC_GS", '{"session_kwargs": {"trust_env": true}}')
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("yam_abc_reproduce.deploy.openpi")
 
+# The request field of the last command sent to the arms, in the layout of ``state``.
+LAST_COMMAND = "last_command"
+
 
 def _parse_key_map(spec: str | None) -> dict[str, str]:
     if not spec:
@@ -61,21 +67,27 @@ class RemapPolicy:
     ``state``/``prompt`` through. If your config expects images flattened as
     top-level ``observation/...`` keys instead of a nested ``images`` dict,
     set ``flatten_prefix`` and each image goes to
-    ``f"{flatten_prefix}{model_key}"``.
+    ``f"{flatten_prefix}{model_key}"``. With ``last_command_key``, the request's
+    ``last_command`` goes to that key, and a request without it is refused.
     """
 
     def __init__(self, policy, image_key_map: dict[str, str], flatten_prefix: str | None,
-                 state_key: str = "state"):
+                 state_key: str = "state", last_command_key: str | None = None):
         self._policy = policy
         self._map = image_key_map
         self._flatten = flatten_prefix
         self._state_key = state_key
+        self._last_command_key = last_command_key
         self.metadata = getattr(policy, "metadata", {})
 
     def infer(self, obs: dict) -> dict:
         images = obs.get("images", {})
         remapped = {self._map.get(role, role): np.asarray(img) for role, img in images.items()}
         model_obs: dict = {self._state_key: np.asarray(obs["state"], dtype=np.float32)}
+        if self._last_command_key is not None:
+            if LAST_COMMAND not in obs:
+                raise KeyError(f"the request has no {LAST_COMMAND!r}: the state input needs it")
+            model_obs[self._last_command_key] = np.asarray(obs[LAST_COMMAND], dtype=np.float32)
         if "prompt" in obs:
             model_obs["prompt"] = str(obs["prompt"])
         if self._flatten:
@@ -120,6 +132,13 @@ def main() -> None:
         help="key the model's Input transform reads state from (e.g. "
         "'observation/state' for the YAM-ABC-Reproduce YAM config; default 'state')",
     )
+    p.add_argument(
+        "--last-command-key",
+        default=None,
+        help="key the model's Input transform reads the last command from (e.g. "
+        "'observation/last_command' for a YAM config with a last-command state input); "
+        "if set, each request must hold 'last_command'",
+    )
     args = p.parse_args()
 
     from openpi.policies import policy_config
@@ -142,7 +161,13 @@ def main() -> None:
         norm_stats=norm_stats,
         pytorch_device=args.device,
     )
-    wrapped = RemapPolicy(policy, _parse_key_map(args.image_key_map), args.flatten_prefix, args.state_key)
+    wrapped = RemapPolicy(
+        policy,
+        _parse_key_map(args.image_key_map),
+        args.flatten_prefix,
+        args.state_key,
+        args.last_command_key,
+    )
 
     # Expose the raw state dim (7 per arm) in metadata for the client's dim check (YAM configs).
     meta = {"backend": "openpi", "config": args.config, **wrapped.metadata}
@@ -160,6 +185,8 @@ def main() -> None:
             "state": np.zeros(7 * n_arms, dtype=np.float32),
             "prompt": args.prompt or "warmup",
         }
+        if args.last_command_key is not None:
+            dummy[LAST_COMMAND] = np.zeros(7 * n_arms, dtype=np.float32)
         log.info("warm-up inference (JIT compile, may take 1-2 min)...")
         t0 = _time.time()
         wrapped.infer(dummy)
